@@ -13,11 +13,14 @@ pip install -r requirements.txt
 python blox2rtl.py
 ```
 
-テストは標準ライブラリだけで回る(PySide6 も不要)。
+テストは標準ライブラリだけで回る。
 
 ```powershell
 python -m unittest discover -s tests
 ```
+
+`verilog.py` のテストは PySide6 なしで動く。GUI 側のテストは PySide6 があれば
+offscreen で走り、無ければスキップされる。
 
 GUI を使わずに Verilog を出すこともできる。
 
@@ -108,13 +111,7 @@ GUI 側は `MainWindow.collectItemsData()` でその形を作り、保存と Ver
 
 ## 既知の問題
 
-- **Wire 名が空欄のサブモジュールを置くと落ちる。** `SubmoduleDialog.get_table_data()` は
-  Wire 名が空のとき2要素のタプルを返すが、`BlockItem.sink_wires()` / `source_wires()` /
-  `paint()` は3要素前提で展開している (`ValueError: not enough values to unpack`)。
-  `verilog.py` 側は2要素を未接続として扱う
 - `WireItem.get_uniq_x()` の `sorted_xs = mid_xs.sort()` は `None` を返しており未使用。
   縦線の重なり回避が意図どおり効いていない可能性がある
 - `WireItem.instances` と `vertical_wire_lines` がクラス変数(実質グローバル)で、
   `updateWires()` の呼び出し順に依存している
-- 空の Wire 名同士が同名として結線される可能性がある(`updateWires()` は
-  wire 名の一致だけで繋ぐため)

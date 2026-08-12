@@ -21,6 +21,17 @@ def bitwidth2linewidth(bit_width):
     else: wire_width = 4
     return wire_width
 
+def port_fields(entry):
+    """ポート定義を (名前, ビット幅, wire名) に揃える。
+
+    SubmoduleDialog.get_table_data() は Wire 名が空欄のとき2要素のまま返すので、
+    3要素前提で展開すると ValueError になる。接続先未定のポートとして扱う。
+    """
+    name = entry[0]
+    width = entry[1] if len(entry) > 1 else 1
+    wire = entry[2] if len(entry) > 2 else ""
+    return name, width, wire
+
 # モジュール情報入力ダイアログ
 # モジュール名を描画するクラス
 class ModuleNameItem(QtWidgets.QGraphicsTextItem):
@@ -163,7 +174,8 @@ class BlockItem(QtWidgets.QGraphicsRectItem):
     def sink_wires(self):
         wires = []
         # input ports are sinks
-        for i, (portname, width, wire_name) in enumerate(self.module_data["inputs"]):
+        for i, entry in enumerate(self.module_data["inputs"]):
+            portname, width, wire_name = port_fields(entry)
             x_pos = self.rect().x() - self.wire_length
             y_pos = self.rect().y() + self.first_port_offset + i * self.port_separation
             pos = self.mapToScene(x_pos, y_pos)
@@ -173,7 +185,8 @@ class BlockItem(QtWidgets.QGraphicsRectItem):
     def source_wires(self):
         wires = []
         # output ports are sources
-        for i, (name, width, wire) in enumerate(self.module_data["outputs"]):
+        for i, entry in enumerate(self.module_data["outputs"]):
+            name, width, wire = port_fields(entry)
             x_pos = self.rect().x() + self.rect().width() + self.wire_length
             y_pos = self.rect().y() + self.first_port_offset + i * self.port_separation
             pos = self.mapToScene(x_pos, y_pos)
@@ -247,7 +260,8 @@ class BlockItem(QtWidgets.QGraphicsRectItem):
 
         painter.setFont(font)
         port_separation = self.port_separation
-        for i, (name, width, wire) in enumerate(self.module_data["inputs"]):
+        for i, entry in enumerate(self.module_data["inputs"]):
+            name, width, wire = port_fields(entry)
             y_pos = self.rect().y() + self.first_port_offset + i * port_separation
             bit_width = f"[{width-1}:0]" if width > 1 else ""
             painter.drawText(self.rect().x() + 5, y_pos, f"{name} {bit_width}")
@@ -267,7 +281,8 @@ class BlockItem(QtWidgets.QGraphicsRectItem):
             painter.drawText(arrow_start_x, arrow_start_y - 5, wire)
         
         # 出力ポート名とワイヤーの描画
-        for i, (name, width, wire) in enumerate(self.module_data["outputs"]):
+        for i, entry in enumerate(self.module_data["outputs"]):
+            name, width, wire = port_fields(entry)
             y_pos = self.rect().y() + self.first_port_offset + i * port_separation
             bit_width = f"[{width-1}:0]" if width > 1 else ""
             text = f"{name} {bit_width}"
@@ -678,6 +693,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ワイヤーを作成
         for src_wire, srcpos, srcw in wire_srcs:
+            # Wire 名が空欄のポートは接続先未定。空文字列同士を同名として
+            # 結線してしまわないように、ここで除く
+            if not src_wire:
+                continue
             for snk_wire, snkpos, snkw in wire_snks:
                 if src_wire == snk_wire:
                     if src_wire not in self.wires_to_hide:
