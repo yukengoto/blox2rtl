@@ -5,6 +5,8 @@ from PySide6 import QtCore, QtWidgets, QtGui, QtPrintSupport
 from ModuleDialog import ModuleDialog
 from ModuleDialog import SubmoduleDialog
 
+import verilog
+
 BG_COLOR = "white"
 BLOCK_COLOR = "lightblue"
 WIRE_COLOR = "black"
@@ -526,6 +528,10 @@ class MainWindow(QtWidgets.QMainWindow):
         saveAction.triggered.connect(self.saveDiagram)
         fileMenu.addAction(saveAction)
 
+        exportVerilogAction = QtGui.QAction("Verilogを出力", self)
+        exportVerilogAction.triggered.connect(self.exportVerilog)
+        fileMenu.addAction(exportVerilogAction)
+
         printAction = QtGui.QAction("印刷", self)
         printAction.triggered.connect(self.printDiagram)
         fileMenu.addAction(printAction)
@@ -690,7 +696,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 junction = JunctionItem(point.x(), point.y())
                 self.scene.addItem(junction)
 
-    def saveDiagram(self):
+    def collectItemsData(self):
+        """シーンの内容を保存形式 (dict のリスト) にする。
+
+        保存と Verilog 出力の両方から使う。
+        """
         items_data = []
         for item in self.scene.items():
             if isinstance(item, ModuleNameItem):
@@ -717,14 +727,37 @@ class MainWindow(QtWidgets.QMainWindow):
                     "module_data": item.module_data
                 })
         items_data.append({
-            "type": "global", 
-            "wires_to_hide": self.wires_to_hide 
+            "type": "global",
+            "wires_to_hide": self.wires_to_hide
         })
-        
+        return items_data
+
+    def saveDiagram(self):
+        items_data = self.collectItemsData()
+
         file_path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "ブロック図を保存", "", "JSON Files (*.json)")
         if file_path:
             with open(file_path, 'w') as file:
                 json.dump(items_data, file, indent=4)
+
+    def exportVerilog(self):
+        try:
+            text, warnings = verilog.generate(self.collectItemsData())
+        except verilog.GenerationError as error:
+            QtWidgets.QMessageBox.warning(self, "Verilog出力", str(error))
+            return
+
+        default_name = f"{self.module_name_item.toPlainText()}.v"
+        file_path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Verilogを出力", default_name, "Verilog Files (*.v)")
+        if not file_path:
+            return
+
+        with open(file_path, 'w', encoding='utf-8') as file:
+            file.write(text)
+
+        if warnings:
+            QtWidgets.QMessageBox.information(self, "Verilog出力",
+                                              "出力しました。以下を確認してください。\n\n" + "\n".join(warnings))
 
     def openDiagram(self):
         file_path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "ブロック図を開く", "", "JSON Files (*.json)")
