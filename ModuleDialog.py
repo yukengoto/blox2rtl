@@ -3,48 +3,21 @@ from PySide6 import QtCore, QtGui, QtWidgets
 import validate
 
 # キー割り当ての説明。ダイアログ下部に出す
-SHORTCUT_HINT = ("Ctrl+I 入力追加    Ctrl+O 出力追加    Tab 次のセル    "
-                 "Enter 次の行    Ctrl+Enter OK    Esc 取消")
-
-
-class PortItemDelegate(QtWidgets.QStyledItemDelegate):
-    """セル編集中の Enter を捕まえるためのデリゲート。
-
-    closeEditor() を見る手もあるが、カレントセルが移っただけでも同じ hint で
-    閉じるため、Enter 以外でも行送りが起きてしまう。ここで Enter だけを拾う。
-    """
-
-    returnPressed = QtCore.Signal()
-
-    def eventFilter(self, editor, event):
-        if event.type() == QtCore.QEvent.Type.KeyPress \
-                and event.key() in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter) \
-                and not event.modifiers() & QtCore.Qt.ControlModifier:
-            self.commitData.emit(editor)
-            self.closeEditor.emit(
-                editor, QtWidgets.QAbstractItemDelegate.EndEditHint.NoHint)
-            self.returnPressed.emit()
-            return True
-        return super().eventFilter(editor, event)
+SHORTCUT_HINT = ("Ctrl+I 入力追加    Ctrl+O 出力追加    Tab 次のセル(行末で次の行)    "
+                 "Enter 編集終了    Ctrl+Enter OK    Esc 取消")
 
 
 class PortTable(QtWidgets.QTableWidget):
-    """行末まで来たら次の行を足す表。
+    """行末で Tab を押すと次の行を足す表。
 
     Tab はセル編集中にエディタが先に食うので keyPressEvent では捕まらない。
     エディタを閉じたあと view が呼ぶ moveCursor() を見る。
-    Enter は PortItemDelegate から受ける。
+
+    Enter には手を入れない。Qt の既定どおり、編集を確定してエディタを閉じ、
+    カレントセルはその場に留まる。行を送るのは Tab の役割。
     """
 
     appendRowRequested = QtCore.Signal()
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        delegate = PortItemDelegate(self)
-        # エディタを閉じ切ってから動かす
-        delegate.returnPressed.connect(
-            lambda: QtCore.QTimer.singleShot(0, self.goToNextRow))
-        self.setItemDelegate(delegate)
 
     def moveCursor(self, action, modifiers):
         if action == QtWidgets.QAbstractItemView.CursorAction.MoveNext:
@@ -54,50 +27,37 @@ class PortTable(QtWidgets.QTableWidget):
                 return self.model().index(self.rowCount() - 1, 0)
         return super().moveCursor(action, modifiers)
 
-    def keyPressEvent(self, event):
-        if event.key() in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter) \
-                and not event.modifiers() & QtCore.Qt.ControlModifier:
-            self.goToNextRow()
-            event.accept()
-            return
-        super().keyPressEvent(event)
-
     def setCellWidget(self, row, column, widget):
         # セルに置いたウィジェット (チェックボックス) はフォーカスチェーンに
-        # 入るため、そこで押された Tab / Enter は表に届かない。横取りする
+        # 入るため、そこで押された Tab は表に届かない。横取りする
         super().setCellWidget(row, column, widget)
         if widget is not None:
             widget.installEventFilter(self)
 
     def eventFilter(self, watched, event):
-        if event.type() == QtCore.QEvent.Type.KeyPress:
-            key = event.key()
-            if key == QtCore.Qt.Key_Tab and not event.modifiers() & QtCore.Qt.ShiftModifier:
-                index = self.indexAt(watched.pos())
-                if self._is_last_cell(index.row(), index.column()):
-                    self.appendRowRequested.emit()
-                    return True
-            elif key in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
-                self.setFocus()
-                self.goToNextRow()
+        if event.type() == QtCore.QEvent.Type.KeyPress \
+                and event.key() == QtCore.Qt.Key_Tab \
+                and not event.modifiers() & QtCore.Qt.ShiftModifier:
+            index = self.indexAt(watched.pos())
+            if self._is_last_cell(index.row(), index.column()):
+                self.appendRowRequested.emit()
                 return True
         return super().eventFilter(watched, event)
 
-    def goToNextRow(self):
-        """次の行の先頭へ。最終行なら行を足す。"""
-        row = self.currentRow()
-        if row < 0:
+    def _is_last_cell(self, row, column):
+        return row == self.rowCount() - 1 and column == self.columnCount() - 1
+
+    def beginEditCurrent(self):
+        """カレントセルの編集を始める。
+
+        行の追加直後に遅延して呼ばれる。その間に行が消える (未入力行の削除など)
+        ことがあるので、捕まえたアイテムではなくその時点のカレントを見る。
+        """
+        if not self.isVisible():
             return
-        if row == self.rowCount() - 1:
-            self.appendRowRequested.emit()
-            return  # 追加側がカーソルを移す
-        self.setCurrentCell(row + 1, 0)
         item = self.currentItem()
         if item is not None:
             self.editItem(item)
-
-    def _is_last_cell(self, row, column):
-        return row == self.rowCount() - 1 and column == self.columnCount() - 1
 
 
 class BaseModuleDialog(QtWidgets.QDialog):
@@ -318,9 +278,9 @@ class BaseModuleDialog(QtWidgets.QDialog):
         table.setItem(row, validate.COL_NAME, name_item)
         table.setCurrentCell(row, validate.COL_NAME)
         table.setFocus()
-        # moveCursor / closeEditor の途中から呼ばれることがあるので、
+        # moveCursor の途中から呼ばれることがあるので、
         # 編集開始はいったんイベントループに返してから
-        QtCore.QTimer.singleShot(0, lambda: table.editItem(name_item))
+        QtCore.QTimer.singleShot(0, table.beginEditCurrent)
         return row
 
     def add_input_port(self):
@@ -409,7 +369,39 @@ class BaseModuleDialog(QtWidgets.QDialog):
             table.setFocus()
             table.setCurrentCell(issue.row, max(issue.column, 0))
 
+    def is_blank_row(self, table, row):
+        """一度も入力されていない行か。
+
+        Tab や Ctrl+I で足した行が末尾に余りがちなので、閉じるときに捨てる。
+        追加直後の行はビット幅に既定値 1 が入っているため、それも空とみなす。
+        """
+        name = table.item(row, validate.COL_NAME)
+        if name and name.text().strip():
+            return False
+
+        width = table.item(row, validate.COL_WIDTH)
+        if width and width.text().strip() not in ("", "1"):
+            return False
+
+        if self.is_instance:  # Wire 名の列を持つのはサブモジュール側だけ
+            wire = table.item(row, validate.COL_WIRE)
+            if wire and wire.text().strip():
+                return False
+
+        return True
+
+    def drop_blank_rows(self):
+        """未入力の行を削除する。何行消したかを返す。"""
+        dropped = 0
+        for table in (self.input_table, self.output_table):
+            for row in reversed(range(table.rowCount())):
+                if self.is_blank_row(table, row):
+                    table.removeRow(row)
+                    dropped += 1
+        return dropped
+
     def accept(self):
+        self.drop_blank_rows()
         errors, warnings = self.check_input()
 
         if errors:

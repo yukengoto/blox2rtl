@@ -111,5 +111,93 @@ class UpdateWiresTest(unittest.TestCase):
         self.assertEqual(wires[0].name, "net")
 
 
+@unittest.skipIf(QtWidgets is None, "PySide6 が無い")
+class SceneRectTest(unittest.TestCase):
+    def make_window(self):
+        window = blox2rtl.MainWindow()
+        block = blox2rtl.BlockItem(0, 0, 150, 50, main_window=window, module_data={
+            "module_name": "a", "instance_name": "u_a",
+            "inputs": [], "outputs": [("y", 1, "net")]})
+        window.scene.addItem(block)
+        window.updateWires()
+        return window, block
+
+    def test_canvas_shrinks_when_items_move_back(self):
+        """指定しないと sceneRect は広がる一方で縮まない。"""
+        window, block = self.make_window()
+
+        block.setPos(2000, 1500)
+        window.updateWires()
+        widened = window.scene.sceneRect()
+
+        block.setPos(0, 0)
+        window.updateWires()
+        shrunk = window.scene.sceneRect()
+
+        self.assertLess(shrunk.width(), widened.width())
+        self.assertLess(shrunk.height(), widened.height())
+
+    def test_canvas_covers_the_items(self):
+        window, _ = self.make_window()
+        self.assertTrue(
+            window.scene.sceneRect().contains(window.scene.itemsBoundingRect()))
+
+    def test_canvas_is_aligned_to_the_grid(self):
+        window, block = self.make_window()
+        block.setPos(37, 63)
+        window.updateWires()
+        rect = window.scene.sceneRect()
+        for value in (rect.left(), rect.top(), rect.right(), rect.bottom()):
+            self.assertEqual(value % blox2rtl.GRID_SIZE, 0, value)
+
+    def test_border_and_grid_are_view_side(self):
+        """印刷は scene.render() を通る。ビュー側に描いていれば紙に出ない。"""
+        window, _ = self.make_window()
+        self.assertTrue(hasattr(window.view, "drawBackground"))
+        self.assertFalse(hasattr(type(window.scene), "drawBackground_override"))
+        # グリッドは QGraphicsItem として置かない (置くと itemsBoundingRect が
+        # 自分自身で広がり続ける)
+        kinds = {type(item).__name__ for item in window.scene.items()}
+        self.assertNotIn("QGraphicsLineItem", kinds)
+
+
+@unittest.skipIf(QtWidgets is None, "PySide6 が無い")
+class SaveFileTest(unittest.TestCase):
+    def test_starts_with_no_file(self):
+        window = blox2rtl.MainWindow()
+        self.assertIsNone(window.current_file_path)
+        self.assertIn("未保存", window.windowTitle())
+
+    def test_write_remembers_the_path(self):
+        import json
+        import tempfile
+
+        window = blox2rtl.MainWindow()
+        window.module_name_item.setPlainText("counter")
+        with tempfile.TemporaryDirectory() as folder:
+            path = str(Path(folder) / "diagram.json")
+            window.writeDiagram(path)
+
+            self.assertEqual(window.current_file_path, path)
+            self.assertIn("diagram.json", window.windowTitle())
+            with open(path, encoding="utf-8") as handle:
+                saved = json.load(handle)
+            self.assertTrue(any(item.get("text") == "counter" for item in saved))
+
+    def test_overwrite_uses_the_remembered_path(self):
+        import tempfile
+
+        window = blox2rtl.MainWindow()
+        with tempfile.TemporaryDirectory() as folder:
+            path = str(Path(folder) / "diagram.json")
+            window.writeDiagram(path)
+
+            window.module_name_item.setPlainText("changed")
+            window.saveDiagram()   # ダイアログを出さずに上書きされること
+
+            with open(path, encoding="utf-8") as handle:
+                self.assertIn("changed", handle.read())
+
+
 if __name__ == "__main__":
     unittest.main()

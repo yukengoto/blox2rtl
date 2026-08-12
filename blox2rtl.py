@@ -1,5 +1,7 @@
 import sys
 import json
+import math
+from pathlib import Path
 from PySide6 import QtCore, QtWidgets, QtGui, QtPrintSupport
 
 from ModuleDialog import ModuleDialog
@@ -14,6 +16,15 @@ LINE_COLOR = "black"
 TEXT_COLOR = "black"
 FOCUS_COLOR = "red"
 GRID_SIZE = 10
+
+GRID_COLOR = "#e8e8e8"
+GRID_MAJOR_COLOR = "#c8c8c8"
+GRID_MAJOR_EVERY = 10          # 10 マスごとに濃い線
+GRID_MIN_PIXELS = 4            # 画面上でこれより細かくなったら細線は描かない
+CANVAS_BORDER_COLOR = "#909090"
+CANVAS_MARGIN = 40             # 要素の外接矩形にこれだけ余白を足す
+
+WINDOW_TITLE = "ブロック図作成ツール"
 
 def bitwidth2linewidth(bit_width):
     if bit_width == 1: wire_width = 1
@@ -476,9 +487,74 @@ class WireItem(QtWidgets.QGraphicsPathItem):
 
 # カスタムQGraphicsViewクラスを作成
 class CustomGraphicsView(QtWidgets.QGraphicsView):
+    """グリッドとキャンバス枠を描くビュー。
+
+    どちらも画面上の目安なので、ビュー側に描く。scene.render() はビューの
+    drawBackground / drawForeground を呼ばないため、印刷には出ない。
+    """
+
     def __init__(self, scene, parent=None):
         super().__init__(scene, parent)
         self.main_window = parent
+        self.show_grid = True
+        self.show_canvas_border = True
+
+    def setShowGrid(self, visible):
+        self.show_grid = visible
+        self.viewport().update()
+
+    def setShowCanvasBorder(self, visible):
+        self.show_canvas_border = visible
+        self.viewport().update()
+
+    def drawBackground(self, painter, rect):
+        super().drawBackground(painter, rect)
+        if not self.show_grid:
+            return
+
+        # 縮小しすぎたときに線を敷き詰めない
+        scale = self.transform().m11()
+        draw_minor = GRID_SIZE * scale >= GRID_MIN_PIXELS
+        major_step = GRID_SIZE * GRID_MAJOR_EVERY
+        if major_step * scale < GRID_MIN_PIXELS:
+            return
+
+        minor_lines, major_lines = [], []
+
+        x = math.floor(rect.left() / GRID_SIZE) * GRID_SIZE
+        while x <= rect.right():
+            line = QtCore.QLineF(x, rect.top(), x, rect.bottom())
+            if x % major_step == 0:
+                major_lines.append(line)
+            elif draw_minor:
+                minor_lines.append(line)
+            x += GRID_SIZE
+
+        y = math.floor(rect.top() / GRID_SIZE) * GRID_SIZE
+        while y <= rect.bottom():
+            line = QtCore.QLineF(rect.left(), y, rect.right(), y)
+            if y % major_step == 0:
+                major_lines.append(line)
+            elif draw_minor:
+                minor_lines.append(line)
+            y += GRID_SIZE
+
+        # 太さ 0 は拡大率によらず 1px (コスメティックペン)
+        if minor_lines:
+            painter.setPen(QtGui.QPen(QtGui.QColor(GRID_COLOR), 0))
+            painter.drawLines(minor_lines)
+        if major_lines:
+            painter.setPen(QtGui.QPen(QtGui.QColor(GRID_MAJOR_COLOR), 0))
+            painter.drawLines(major_lines)
+
+    def drawForeground(self, painter, rect):
+        super().drawForeground(painter, rect)
+        if not self.show_canvas_border:
+            return
+        pen = QtGui.QPen(QtGui.QColor(CANVAS_BORDER_COLOR), 0, QtCore.Qt.DashLine)
+        painter.setPen(pen)
+        painter.setBrush(QtCore.Qt.NoBrush)
+        painter.drawRect(self.sceneRect())
 
     def keyPressEvent(self, event):
         # 選択されているアイテムを取得
@@ -536,18 +612,26 @@ class MainWindow(QtWidgets.QMainWindow):
         fileMenu = menubar.addMenu("ファイル")
 
         openAction = QtGui.QAction("ブロック図を開く", self)
+        openAction.setShortcut(QtGui.QKeySequence.Open)
         openAction.triggered.connect(self.openDiagram)
         fileMenu.addAction(openAction)
-        
-        saveAction = QtGui.QAction("ブロック図を保存", self)
+
+        saveAction = QtGui.QAction("上書き保存", self)
+        saveAction.setShortcut(QtGui.QKeySequence.Save)
         saveAction.triggered.connect(self.saveDiagram)
         fileMenu.addAction(saveAction)
+
+        saveAsAction = QtGui.QAction("名前を付けて保存", self)
+        saveAsAction.setShortcut(QtGui.QKeySequence.SaveAs)
+        saveAsAction.triggered.connect(self.saveDiagramAs)
+        fileMenu.addAction(saveAsAction)
 
         exportVerilogAction = QtGui.QAction("Verilogを出力", self)
         exportVerilogAction.triggered.connect(self.exportVerilog)
         fileMenu.addAction(exportVerilogAction)
 
         printAction = QtGui.QAction("印刷", self)
+        printAction.setShortcut(QtGui.QKeySequence.Print)
         printAction.triggered.connect(self.printDiagram)
         fileMenu.addAction(printAction)
        
@@ -572,6 +656,23 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # ショートカットキーの設定
         deleteBlockAction.setShortcut(QtGui.QKeySequence.Delete)
+
+        # 表示メニュー
+        viewMenu = menubar.addMenu("表示")
+
+        self.showGridAction = QtGui.QAction("グリッドを表示", self, checkable=True)
+        self.showGridAction.setChecked(True)
+        self.showGridAction.toggled.connect(self.view.setShowGrid)
+        viewMenu.addAction(self.showGridAction)
+
+        self.showBorderAction = QtGui.QAction("キャンバス枠を表示", self, checkable=True)
+        self.showBorderAction.setChecked(True)
+        self.showBorderAction.toggled.connect(self.view.setShowCanvasBorder)
+        viewMenu.addAction(self.showBorderAction)
+
+        fitAction = QtGui.QAction("キャンバス全体を表示", self)
+        fitAction.triggered.connect(self.fitCanvas)
+        viewMenu.addAction(fitAction)
 
         # # ツールバーにボタンを配置
         # toolbar = QtWidgets.QToolBar("ツール")
@@ -605,6 +706,48 @@ class MainWindow(QtWidgets.QMainWindow):
         self.module_name_item = ModuleNameItem("ModuleName")
         self.scene.addItem(self.module_name_item)
         self.wires_to_hide = [] # add names of wires to hide
+
+        self.current_file_path = None
+        self.setCurrentFile(None)
+        self.updateSceneRect()
+
+    # -- キャンバス ---------------------------------------------------------
+
+    def updateSceneRect(self):
+        """置かれている要素の範囲にキャンバスを合わせる。
+
+        sceneRect を指定しないと、QGraphicsScene は過去に置かれた全アイテムの
+        外接矩形を保持し続けて縮まない。毎回入れ直すことで広がりも縮みも追う。
+        """
+        rect = self.scene.itemsBoundingRect()
+        if rect.isNull():
+            rect = QtCore.QRectF(0, 0, 400, 300)
+
+        left = math.floor((rect.left() - CANVAS_MARGIN) / GRID_SIZE) * GRID_SIZE
+        top = math.floor((rect.top() - CANVAS_MARGIN) / GRID_SIZE) * GRID_SIZE
+        right = math.ceil((rect.right() + CANVAS_MARGIN) / GRID_SIZE) * GRID_SIZE
+        bottom = math.ceil((rect.bottom() + CANVAS_MARGIN) / GRID_SIZE) * GRID_SIZE
+
+        self.scene.setSceneRect(left, top, right - left, bottom - top)
+        self.view.viewport().update()   # 枠を描き直す
+        self.showCanvasSize()
+
+    def showCanvasSize(self):
+        rect = self.scene.sceneRect()
+        self.statusBar().showMessage(
+            f"キャンバス {int(rect.width())} × {int(rect.height())}"
+            f"    グリッド {GRID_SIZE}")
+
+    def fitCanvas(self):
+        self.view.fitInView(self.scene.sceneRect(), QtCore.Qt.KeepAspectRatio)
+        self.view.viewport().update()
+
+    # -- ファイル -----------------------------------------------------------
+
+    def setCurrentFile(self, file_path):
+        self.current_file_path = file_path
+        name = Path(file_path).name if file_path else "(未保存)"
+        self.setWindowTitle(f"{name} - {WINDOW_TITLE}")
     
     def editModule(self):
         module_data = {
@@ -715,6 +858,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 junction = JunctionItem(point.x(), point.y())
                 self.scene.addItem(junction)
 
+        # 要素が動いたあとなので、キャンバスの範囲を取り直す
+        self.updateSceneRect()
+
     def collectItemsData(self):
         """シーンの内容を保存形式 (dict のリスト) にする。
 
@@ -752,12 +898,23 @@ class MainWindow(QtWidgets.QMainWindow):
         return items_data
 
     def saveDiagram(self):
-        items_data = self.collectItemsData()
+        """上書き保存。保存先が未定なら名前を付けて保存に落とす。"""
+        if not self.current_file_path:
+            return self.saveDiagramAs()
+        self.writeDiagram(self.current_file_path)
 
-        file_path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "ブロック図を保存", "", "JSON Files (*.json)")
+    def saveDiagramAs(self):
+        file_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "名前を付けて保存", self.current_file_path or "", "JSON Files (*.json)")
         if file_path:
-            with open(file_path, 'w') as file:
-                json.dump(items_data, file, indent=4)
+            self.writeDiagram(file_path)
+
+    def writeDiagram(self, file_path):
+        items_data = self.collectItemsData()
+        with open(file_path, 'w', encoding='utf-8') as file:
+            json.dump(items_data, file, indent=4)
+        self.setCurrentFile(file_path)
+        self.statusBar().showMessage(f"保存しました: {file_path}", 3000)
 
     def exportVerilog(self):
         try:
@@ -781,9 +938,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def openDiagram(self):
         file_path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "ブロック図を開く", "", "JSON Files (*.json)")
         if file_path:
-            with open(file_path, 'r') as file:
+            with open(file_path, 'r', encoding='utf-8') as file:
                 items_data = json.load(file)
-            
+
             self.scene.clear()
             for item_data in items_data:
                 if item_data["type"] == "module_name":
@@ -802,6 +959,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 elif item_data["type"] == "global":
                     self.wires_to_hide = item_data["wires_to_hide"]
             self.updateWires()
+            self.setCurrentFile(file_path)
 
     def printDiagram(self):
         printer = QtPrintSupport.QPrinter(QtPrintSupport.QPrinter.HighResolution)

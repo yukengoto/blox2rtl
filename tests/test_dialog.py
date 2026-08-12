@@ -132,7 +132,8 @@ class RowAppendTest(unittest.TestCase):
         flush()
         self.assertEqual(table.rowCount(), before)
 
-    def test_enter_moves_to_the_next_row(self):
+    def test_enter_stays_on_the_same_cell(self):
+        """Enter は編集終了。行を送るのは Tab の役目。"""
         dlg = dialogs.SubmoduleDialog(module_data={
             "module_name": "blk", "instance_name": "u_blk",
             "inputs": [("a", 1, "n0"), ("b", 1, "n1")], "outputs": [],
@@ -143,10 +144,10 @@ class RowAppendTest(unittest.TestCase):
         before = table.rowCount()
         QtTest.QTest.keyClick(table, QtCore.Qt.Key_Return)
         flush()
-        self.assertEqual(table.currentRow(), 1)
+        self.assertEqual(table.currentRow(), 0)
         self.assertEqual(table.rowCount(), before)
 
-    def test_enter_on_the_last_row_appends(self):
+    def test_enter_on_the_last_row_does_not_append(self):
         dlg = self.make_submodule()
         dlg.show()
         table = dlg.input_table
@@ -154,7 +155,7 @@ class RowAppendTest(unittest.TestCase):
         before = table.rowCount()
         QtTest.QTest.keyClick(table, QtCore.Qt.Key_Return)
         flush()
-        self.assertEqual(table.rowCount(), before + 1)
+        self.assertEqual(table.rowCount(), before)
 
 
 @unittest.skipIf(QtWidgets is None, "PySide6 が無い")
@@ -211,6 +212,47 @@ class AcceptValidationTest(unittest.TestCase):
         dlg.focus_issue(errors[0])
         self.assertEqual(dlg.input_table.currentRow(), 1)
         self.assertEqual(dlg.input_table.currentColumn(), validate.COL_NAME)
+
+    def test_blank_rows_are_dropped_on_close(self):
+        """Tab や Ctrl+I で余った未入力行を、閉じるときに捨てる。"""
+        dlg = dialogs.ModuleDialog(module_data={
+            "module_name": "top", "inputs": [("a", 1, False)], "outputs": [],
+        })
+        dlg.show()
+        dlg.append_input_port()   # 未入力の行が末尾に増える
+        dlg.append_input_port()
+        self.assertEqual(dlg.input_table.rowCount(), 3)
+
+        dlg.accept()
+        flush()
+        self.assertEqual(dlg.input_table.rowCount(), 1)
+        self.assertEqual(dlg.result(), QtWidgets.QDialog.Accepted)
+
+    def test_a_partly_filled_row_is_kept_and_reported(self):
+        """名前だけ入れた行は捨てずにエラーにする(打ちかけを消さない)。"""
+        dlg = dialogs.ModuleDialog(module_data={
+            "module_name": "top", "inputs": [("a", 1, False)], "outputs": [],
+        })
+        dlg.append_input_port()
+        row = dlg.input_table.rowCount() - 1
+        dlg.input_table.item(row, validate.COL_WIDTH).setText("")
+        dlg.input_table.item(row, validate.COL_NAME).setText("b")
+
+        dropped = dlg.drop_blank_rows()
+        self.assertEqual(dropped, 0)
+        errors, _ = dlg.check_input()
+        self.assertEqual(errors[0].column, validate.COL_WIDTH)
+
+    def test_a_row_with_only_a_wire_name_is_kept(self):
+        dlg = dialogs.SubmoduleDialog(module_data={
+            "module_name": "blk", "instance_name": "u_blk",
+            "inputs": [("a", 1, "net")], "outputs": [],
+        })
+        dlg.append_input_port()
+        row = dlg.input_table.rowCount() - 1
+        dlg.input_table.setItem(row, validate.COL_WIRE,
+                                QtWidgets.QTableWidgetItem("half_typed"))
+        self.assertEqual(dlg.drop_blank_rows(), 0)
 
     def test_missing_wire_name_is_only_a_warning(self):
         dlg = dialogs.SubmoduleDialog(module_data={
