@@ -5,8 +5,11 @@ from pathlib import Path
 from PySide6 import QtCore, QtWidgets, QtGui, QtPrintSupport
 
 from ModuleDialog import ModuleDialog
-from ModuleDialog import SubmoduleDialog
+from ModuleDialog import InstanceDialog
+from ModuleDialog import ModuleDefDialog
+from ModuleDialog import apply_module_change
 
+import netlist
 import verilog
 
 BG_COLOR = "white"
@@ -32,16 +35,30 @@ def bitwidth2linewidth(bit_width):
     else: wire_width = 4
     return wire_width
 
-def port_fields(entry):
-    """ポート定義を (名前, ビット幅, wire名) に揃える。
+MISSING_MODULE_COLOR = "#f0c0c0"
 
-    SubmoduleDialog.get_table_data() は Wire 名が空欄のとき2要素のまま返すので、
-    3要素前提で展開すると ValueError になる。接続先未定のポートとして扱う。
+
+def snap_to_grid(item):
+    item.setPos(round(item.x() / GRID_SIZE) * GRID_SIZE,
+                round(item.y() / GRID_SIZE) * GRID_SIZE)
+
+
+def snap_selection(moved_item):
+    """まとめて動かした選択アイテムを全部グリッドに合わせる。
+
+    ドラッグを受け取るのは1個だけなので、そのアイテムだけを揃えると
+    一緒に動いた残りがグリッドから外れたままになる。
     """
-    name = entry[0]
-    width = entry[1] if len(entry) > 1 else 1
-    wire = entry[2] if len(entry) > 2 else ""
-    return name, width, wire
+    scene = moved_item.scene()
+    items = list(scene.selectedItems()) if scene else []
+    if moved_item not in items:
+        items.append(moved_item)
+    for item in items:
+        snap_to_grid(item)
+
+    main_window = getattr(moved_item, "main_window", None)
+    if main_window:
+        main_window.updateWires()
 
 # モジュール情報入力ダイアログ
 # モジュール名を描画するクラス
@@ -146,34 +163,52 @@ class PortItem(QtWidgets.QGraphicsPolygonItem):
 
     def mouseReleaseEvent(self, event):
         super().mouseReleaseEvent(event)
-
-        # グリッドにスナップ
-        new_x = round(self.x() / GRID_SIZE) * GRID_SIZE
-        new_y = round(self.y() / GRID_SIZE) * GRID_SIZE
-        self.setPos(new_x, new_y)
-        if self.main_window:
-            self.main_window.updateWires()
-        #self.update()  # 再描画をトリガー
+        snap_selection(self)
 
 
 # サブモジュールブロックを描画するクラス
 class BlockItem(QtWidgets.QGraphicsRectItem):
-    def __init__(self, x, y, width, height, module_data=None, main_window=None):
+    """モジュールのインスタンスを表すブロック。
+
+    ポートの定義は持たない。どのモジュールかという名前だけを持ち、
+    ポートの並びは design.modules から引く。同じモジュールのブロックは
+    すべて同じ定義を見るので、定義を直せば全部に効く。
+    """
+
+    def __init__(self, x, y, width, height, instance=None, main_window=None):
         super().__init__(x, y, width, height)
         self.setFlags(QtWidgets.QGraphicsItem.ItemIsMovable |
                       QtWidgets.QGraphicsItem.ItemIsSelectable)
         self.setBrush(QtGui.QBrush(QtGui.QColor(BLOCK_COLOR)))
         self.main_window = main_window
-        self.module_data = module_data or {
-            "module_name": "module",
-            "instance_name": "instance",
-            "inputs": [],
-            "outputs": []
-        }
+        self.instance = instance or netlist.Instance("module", "instance")
         self.port_separation = 20 # vertical distance between ports
         self.wire_length = 40
         self.first_port_offset = 45
         self.update_size_and_labels()
+
+    def module(self):
+        """このブロックが指すモジュール定義。無ければ None。"""
+        if self.main_window is None:
+            return None
+        return self.main_window.design.modules.get(self.instance.module_name)
+
+    def ports(self):
+        module = self.module()
+        return module.ports() if module else []
+
+    def port_rows(self, direction):
+        """(行番号, Port) を、その向きのポートについて返す。
+
+        行番号は入力・出力それぞれ 0 から数える (左右で高さを揃えるため)。
+        """
+        rows = []
+        index = 0
+        for port_direction, port in self.ports():
+            if port_direction == direction:
+                rows.append((index, port))
+                index += 1
+        return rows
 
     def boundingRect(self):
         # 再描画範囲を拡張して、ワイヤーやワイヤー名を含むようにする
@@ -185,50 +220,47 @@ class BlockItem(QtWidgets.QGraphicsRectItem):
     def sink_wires(self):
         wires = []
         # input ports are sinks
-        for i, entry in enumerate(self.module_data["inputs"]):
-            portname, width, wire_name = port_fields(entry)
+        for i, port in self.port_rows("input"):
             x_pos = self.rect().x() - self.wire_length
             y_pos = self.rect().y() + self.first_port_offset + i * self.port_separation
             pos = self.mapToScene(x_pos, y_pos)
-            wires.append( (wire_name, pos, width) )
+            wires.append((self.instance.wire_for(port.name), pos, port.width))
         return wires
 
     def source_wires(self):
         wires = []
         # output ports are sources
-        for i, entry in enumerate(self.module_data["outputs"]):
-            name, width, wire = port_fields(entry)
+        for i, port in self.port_rows("output"):
             x_pos = self.rect().x() + self.rect().width() + self.wire_length
             y_pos = self.rect().y() + self.first_port_offset + i * self.port_separation
             pos = self.mapToScene(x_pos, y_pos)
-            wires.append( ( wire, pos, width) )
+            wires.append((self.instance.wire_for(port.name), pos, port.width))
         return wires
-        
+
     def update_size_and_labels(self):
         # ポート数に応じて高さを調整
-        max_ports = max(len(self.module_data["inputs"]), len(self.module_data["outputs"]))
-        self.setRect(self.rect().x(), self.rect().y(), 150, self.first_port_offset + max_ports * self.port_separation)
+        module = self.module()
+        max_ports = 0
+        if module:
+            max_ports = max(len(module.inputs), len(module.outputs))
+        self.setRect(self.rect().x(), self.rect().y(), 150,
+                     self.first_port_offset + max_ports * self.port_separation)
 
     def mouseDoubleClickEvent(self, event):
-        dialog = SubmoduleDialog(module_data=self.module_data)
-        if dialog.exec() == QtWidgets.QDialog.Accepted:
-            self.module_data = dialog.get_data()
-            self.update_size_and_labels()
-            self.update()
+        if self.main_window is None:
+            return
+        self.main_window.editInstance(self)
 
     def mouseReleaseEvent(self, event):
         super().mouseReleaseEvent(event)
-
-        # グリッドにスナップ
-        new_x = round(self.x() / GRID_SIZE) * GRID_SIZE
-        new_y = round(self.y() / GRID_SIZE) * GRID_SIZE
-        self.setPos(new_x, new_y)
-
-        if self.main_window:
-            self.main_window.updateWires()
-
+        snap_selection(self)
 
     def paint(self, painter, option, widget=None):
+        # 定義が見つからないインスタンスは色を変えて示す
+        missing = self.module() is None
+        self.setBrush(QtGui.QBrush(QtGui.QColor(
+            MISSING_MODULE_COLOR if missing else BLOCK_COLOR)))
+
         super().paint(painter, option, widget)
         # 枠線の描画
         if self.isSelected():
@@ -250,29 +282,28 @@ class BlockItem(QtWidgets.QGraphicsRectItem):
         module_font.setBold(True)  # 太字に設定
         module_font.setPointSize(fontsize + 4)  # フォントサイズを大きく設定（例: +4ポイント）
         painter.setFont(module_font)
-        painter.drawText(self.rect().x() + 5, self.rect().y() + 20, f"{self.module_data['module_name']}")
+        painter.drawText(self.rect().x() + 5, self.rect().y() + 20,
+                         self.instance.module_name)
 
         # インスタンス名のフォント設定
         instance_font = painter.font()
         instance_font.setBold(True)  # 太字に設定
         instance_font.setPointSize(fontsize)  # フォントサイズを大きく設定（例: +4ポイント）
         painter.setFont(instance_font)
-        painter.drawText(self.rect().x() + 5, self.rect().y() - 5, f"{self.module_data['instance_name']}")
+        painter.drawText(self.rect().x() + 5, self.rect().y() - 5,
+                         self.instance.name)
 
         painter.setPen(QtGui.QPen(QtGui.QColor(TEXT_COLOR)))
         font = painter.font()
-        # font.setBold(True)  # 太字に設定
-        # painter.setFont(font)
-        # painter.drawText(self.rect().x() + 5, self.rect().y() - 5, f"{self.module_data['instance_name']}")
-        # painter.drawText(self.rect().x() + 5, self.rect().y() + 15, f"{self.module_data['module_name']}")
-        font.setBold(False)  # 通常のフォントに戻す 
+        font.setBold(False)  # 通常のフォントに戻す
 
         # 入力ポート名とワイヤーの描画
 
         painter.setFont(font)
         port_separation = self.port_separation
-        for i, entry in enumerate(self.module_data["inputs"]):
-            name, width, wire = port_fields(entry)
+        for i, port in self.port_rows("input"):
+            name, width = port.name, port.width
+            wire = self.instance.wire_for(name)
             y_pos = self.rect().y() + self.first_port_offset + i * port_separation
             bit_width = f"[{width-1}:0]" if width > 1 else ""
             painter.drawText(self.rect().x() + 5, y_pos, f"{name} {bit_width}")
@@ -292,8 +323,9 @@ class BlockItem(QtWidgets.QGraphicsRectItem):
             painter.drawText(arrow_start_x, arrow_start_y - 5, wire)
         
         # 出力ポート名とワイヤーの描画
-        for i, entry in enumerate(self.module_data["outputs"]):
-            name, width, wire = port_fields(entry)
+        for i, port in self.port_rows("output"):
+            name, width = port.name, port.width
+            wire = self.instance.wire_for(name)
             y_pos = self.rect().y() + self.first_port_offset + i * port_separation
             bit_width = f"[{width-1}:0]" if width > 1 else ""
             text = f"{name} {bit_width}"
@@ -380,8 +412,9 @@ class WireItem(QtWidgets.QGraphicsPathItem):
         super().__init__()
         WireItem.instances.append(self)
         self.width = width
-        self.setFlags(QtWidgets.QGraphicsItem.ItemIsSelectable | 
-                      QtWidgets.QGraphicsItem.ItemIsFocusable)
+        # ワイヤーは updateWires() のたびに全部作り直すので、選択させない。
+        # 選んでも次の更新で消えるうえ、矩形選択や矢印キー移動に混ざる
+        self.setFlag(QtWidgets.QGraphicsItem.ItemIsSelectable, False)
         line_width = bitwidth2linewidth(width)
         self.setPen(QtGui.QPen(QtGui.QColor(WIRE_COLOR), line_width, QtCore.Qt.SolidLine))
         
@@ -498,6 +531,45 @@ class CustomGraphicsView(QtWidgets.QGraphicsView):
         self.main_window = parent
         self.show_grid = True
         self.show_canvas_border = True
+
+        # 空白からのドラッグで矩形選択。アイテム上のドラッグは移動のまま。
+        # 判定は既定の IntersectsItemShape のままにする。BlockItem.boundingRect()
+        # はワイヤー用に左右へ 100 広げてあるので、BoundingRect 判定にすると
+        # 本体から離れたところをかすめただけで掴んでしまう
+        self.setDragMode(QtWidgets.QGraphicsView.RubberBandDrag)
+        self.setRubberBandSelectionMode(QtCore.Qt.IntersectsItemShape)
+
+        # 左ドラッグを矩形選択に取られるので、中ボタンで画面を掴んで動かす
+        self._pan_origin = None
+
+    def mousePressEvent(self, event):
+        if event.button() == QtCore.Qt.MiddleButton:
+            self._pan_origin = event.position().toPoint()
+            self.setCursor(QtCore.Qt.ClosedHandCursor)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._pan_origin is not None:
+            point = event.position().toPoint()
+            delta = point - self._pan_origin
+            self._pan_origin = point
+            self.horizontalScrollBar().setValue(
+                self.horizontalScrollBar().value() - delta.x())
+            self.verticalScrollBar().setValue(
+                self.verticalScrollBar().value() - delta.y())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == QtCore.Qt.MiddleButton and self._pan_origin is not None:
+            self._pan_origin = None
+            self.unsetCursor()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def setShowGrid(self, visible):
         self.show_grid = visible
@@ -645,7 +717,16 @@ class MainWindow(QtWidgets.QMainWindow):
         addBlockAction = QtGui.QAction("サブモジュール追加", self)
         addBlockAction.triggered.connect(self.addBlock)
         diagramMenu.addAction(addBlockAction)
-        
+
+        duplicateAction = QtGui.QAction("選択したブロックを複製", self)
+        duplicateAction.setShortcut(QtGui.QKeySequence("Ctrl+D"))
+        duplicateAction.triggered.connect(self.duplicateSelectedBlocks)
+        diagramMenu.addAction(duplicateAction)
+
+        editModuleDefAction = QtGui.QAction("モジュール定義…", self)
+        editModuleDefAction.triggered.connect(self.editModuleDefinition)
+        diagramMenu.addAction(editModuleDefAction)
+
         deleteBlockAction = QtGui.QAction("サブモジュール削除", self)
         deleteBlockAction.triggered.connect(self.deleteSelectedBlock)
         diagramMenu.addAction(deleteBlockAction)
@@ -702,6 +783,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # openAction.triggered.connect(self.connectWires)
         # toolbar.addAction(openAction)
         
+        # モジュール定義はブロックではなく設計側が持つ。
+        # 位置と接続はシーンのアイテムが持ち、定義だけをここで共有する
+        self.design = netlist.Design()
+
         # モジュール名をシーンに追加
         self.module_name_item = ModuleNameItem("ModuleName")
         self.scene.addItem(self.module_name_item)
@@ -785,26 +870,121 @@ class MainWindow(QtWidgets.QMainWindow):
             self.wires_to_hide = dialog.get_hidden_portwires()
             self.updateWires()
     
+    # -- インスタンスとモジュール定義 ---------------------------------------
+
+    def blocks(self):
+        return [item for item in self.scene.items() if isinstance(item, BlockItem)]
+
+    def syncInstances(self):
+        """シーンにあるブロックの内容を design.instances に写す。
+
+        定義の変更を全インスタンスへ反映する処理は design 側にあるので、
+        ダイアログを開く前に実体を揃えておく。
+        """
+        self.design.instances = [block.instance for block in self.blocks()]
+
     def addBlock(self):
-        # サブモジュールの情報を入力するダイアログを開く
-        dialog = SubmoduleDialog()
-        if dialog.exec() == QtWidgets.QDialog.Accepted:
-            #
-            x = 50 + (self.scene.itemsBoundingRect().width() % 400)
-            y = 50 + (self.scene.itemsBoundingRect().height() % 300)
-            block = BlockItem(x, y, 150, 50, main_window=self, module_data=dialog.get_data())
-            self.scene.addItem(block)
+        self.syncInstances()
+        dialog = InstanceDialog(self, design=self.design)
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            self.refreshBlocks()
+            return
+
+        data = dialog.get_data()
+        x = 50 + (self.scene.itemsBoundingRect().width() % 400)
+        y = 50 + (self.scene.itemsBoundingRect().height() % 300)
+        instance = netlist.Instance(data["module_name"], data["instance_name"],
+                                    x, y, data["connections"])
+        block = BlockItem(0, 0, 150, 50, instance=instance, main_window=self)
+        block.setPos(x, y)
+        self.scene.addItem(block)
+        self.refreshBlocks()
+
+    def editInstance(self, block):
+        self.syncInstances()
+        dialog = InstanceDialog(self, design=self.design, instance=block.instance)
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            self.refreshBlocks()
+            return
+
+        data = dialog.get_data()
+        block.instance.module_name = data["module_name"]
+        block.instance.name = data["instance_name"]
+        block.instance.connections = data["connections"]
+        self.refreshBlocks()
+
+    def editModuleDefinition(self):
+        """モジュールを選んで定義を編集する。変更は全インスタンスに効く。"""
+        self.syncInstances()
+        if not self.design.modules:
+            QtWidgets.QMessageBox.information(
+                self, "モジュール定義", "まだモジュールがありません。")
+            return
+
+        name, ok = QtWidgets.QInputDialog.getItem(
+            self, "モジュール定義", "編集するモジュール:",
+            sorted(self.design.modules), 0, False)
+        if not ok:
+            return
+
+        module = self.design.modules[name]
+        dialog = ModuleDefDialog(self, module=module,
+                                 taken_names=self.design.modules)
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return
+
+        apply_module_change(self.design, name, dialog.get_module(),
+                            dialog.get_renames())
+        self.refreshBlocks()
+
+    def duplicateSelectedBlocks(self):
+        """同じモジュールの別インスタンスを作る。接続は引き継がない。"""
+        self.syncInstances()
+        created = []
+        for block in self.scene.selectedItems():
+            if not isinstance(block, BlockItem):
+                continue
+            instance = netlist.Instance(
+                block.instance.module_name,
+                self.design.next_instance_name(block.instance.module_name),
+                block.instance.x + 40, block.instance.y + 40)
+            self.design.instances.append(instance)
+            copy = BlockItem(0, 0, 150, 50, instance=instance, main_window=self)
+            copy.setPos(block.x() + 40, block.y() + 40)
+            self.scene.addItem(copy)
+            created.append(copy)
+
+        if created:
+            self.scene.clearSelection()
+            for block in created:
+                block.setSelected(True)
+            self.refreshBlocks()
+
+    def refreshBlocks(self):
+        """定義が変わったあとにブロックの大きさと表示を作り直す。"""
+        for block in self.blocks():
+            block.update_size_and_labels()
             block.update()
-            self.updateWires()  # update wires
+        self.syncInstances()
+        self.updateWires()
 
     def deleteSelectedBlock(self):
-        for item in self.scene.selectedItems():
-            if isinstance(item, BlockItem):
-                reply = QtWidgets.QMessageBox.question(self, '確認', f"インスタンス '{item.module_data['instance_name']}' を削除しますか？",
-                                                       QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.No)
-                if reply == QtWidgets.QMessageBox.Yes:
-                    self.scene.removeItem(item)
-                    self.updateWires()  # update wires
+        blocks = [item for item in self.scene.selectedItems()
+                  if isinstance(item, BlockItem)]
+        if not blocks:
+            return
+
+        names = "\n".join(f"・{block.instance.name}" for block in blocks)
+        reply = QtWidgets.QMessageBox.question(
+            self, '確認', f"次の {len(blocks)} 個を削除しますか?\n\n{names}",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No)
+        if reply != QtWidgets.QMessageBox.Yes:
+            return
+
+        for block in blocks:
+            self.scene.removeItem(block)
+        self.refreshBlocks()
 
     # MainWindowクラスのupdateWiresメソッドを修正
     def updateWires(self):
@@ -861,41 +1041,37 @@ class MainWindow(QtWidgets.QMainWindow):
         # 要素が動いたあとなので、キャンバスの範囲を取り直す
         self.updateSceneRect()
 
-    def collectItemsData(self):
-        """シーンの内容を保存形式 (dict のリスト) にする。
+    def buildDesign(self):
+        """シーンの内容を netlist.Design にまとめる。
 
+        モジュール定義は self.design が持ち、位置と接続はシーンから拾う。
         保存と Verilog 出力の両方から使う。
         """
-        items_data = []
+        design = netlist.Design(
+            name=self.module_name_item.toPlainText(),
+            name_pos=(self.module_name_item.pos().x(),
+                      self.module_name_item.pos().y()),
+            modules=self.design.modules,
+            wires_to_hide=list(self.wires_to_hide))
+
         for item in self.scene.items():
-            if isinstance(item, ModuleNameItem):
-                items_data.append({
-                    "type": "module_name",
-                    "text": item.toPlainText(),
-                    "x": item.pos().x(),
-                    "y": item.pos().y()
-                })
-            elif isinstance(item, PortItem):
-                items_data.append({
-                    "type": "port",
-                    "name": item.name,
-                    "width": item.width,
-                    "is_input": item.is_input,
-                    "x": item.pos().x(),
-                    "y": item.pos().y()
-                })
+            if isinstance(item, PortItem):
+                port = netlist.TopPort(item.name, item.width, item.is_input,
+                                       item.pos().x(), item.pos().y())
+                (design.inputs if port.is_input else design.outputs).append(port)
             elif isinstance(item, BlockItem):
-                items_data.append({
-                    "type": "submodule",
-                    "x": item.pos().x(),
-                    "y": item.pos().y(),
-                    "module_data": item.module_data
-                })
-        items_data.append({
-            "type": "global",
-            "wires_to_hide": self.wires_to_hide
-        })
-        return items_data
+                item.instance.x = item.pos().x()
+                item.instance.y = item.pos().y()
+                design.instances.append(item.instance)
+
+        design.inputs.sort(key=lambda port: port.y)
+        design.outputs.sort(key=lambda port: port.y)
+        design.instances.sort(key=lambda inst: (inst.x, inst.y))
+        return design
+
+    def collectItemsData(self):
+        """保存形式 (形式2) の dict にする。"""
+        return netlist.dump(self.buildDesign())
 
     def saveDiagram(self):
         """上書き保存。保存先が未定なら名前を付けて保存に落とす。"""
@@ -937,29 +1113,44 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def openDiagram(self):
         file_path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "ブロック図を開く", "", "JSON Files (*.json)")
-        if file_path:
-            with open(file_path, 'r', encoding='utf-8') as file:
-                items_data = json.load(file)
+        if not file_path:
+            return
 
-            self.scene.clear()
-            for item_data in items_data:
-                if item_data["type"] == "module_name":
-                    module_name = ModuleNameItem(item_data["text"])
-                    module_name.setPos(item_data["x"], item_data["y"])
-                    self.scene.addItem(module_name)
-                    self.module_name_item = module_name
-                elif item_data["type"] == "port":
-                    port = PortItem(0, 0, item_data["name"], item_data["width"], item_data["is_input"], main_window=self)
-                    port.setPos(item_data["x"], item_data["y"])
-                    self.scene.addItem(port)
-                elif item_data["type"] == "submodule":
-                    block = BlockItem(0, 0, 150, 50, item_data["module_data"], self)
-                    block.setPos(item_data["x"], item_data["y"])
-                    self.scene.addItem(block)
-                elif item_data["type"] == "global":
-                    self.wires_to_hide = item_data["wires_to_hide"]
-            self.updateWires()
-            self.setCurrentFile(file_path)
+        with open(file_path, 'r', encoding='utf-8') as file:
+            data = json.load(file)
+
+        design, warnings = netlist.load(data)
+        self.loadDesign(design)
+        self.setCurrentFile(file_path)
+
+        if warnings:
+            QtWidgets.QMessageBox.information(
+                self, "読み込み",
+                "読み込みました。以下を確認してください。\n\n"
+                + "\n".join(f"・{message}" for message in warnings))
+
+    def loadDesign(self, design):
+        """Design の内容でシーンを作り直す。"""
+        self.scene.clear()
+        self.design = design
+        self.wires_to_hide = list(design.wires_to_hide)
+
+        self.module_name_item = ModuleNameItem(design.name)
+        self.module_name_item.setPos(*design.name_pos)
+        self.scene.addItem(self.module_name_item)
+
+        for port in design.inputs + design.outputs:
+            item = PortItem(0, 0, port.name, port.width, port.is_input,
+                            main_window=self)
+            item.setPos(port.x, port.y)
+            self.scene.addItem(item)
+
+        for instance in design.instances:
+            block = BlockItem(0, 0, 150, 50, instance=instance, main_window=self)
+            block.setPos(instance.x, instance.y)
+            self.scene.addItem(block)
+
+        self.refreshBlocks()
 
     def printDiagram(self):
         printer = QtPrintSupport.QPrinter(QtPrintSupport.QPrinter.HighResolution)
