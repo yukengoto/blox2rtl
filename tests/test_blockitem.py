@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
-    from PySide6 import QtCore, QtWidgets
+    from PySide6 import QtCore, QtGui, QtWidgets
     import blox2rtl
     import netlist
 except ImportError:  # PySide6 が無い環境
@@ -315,6 +315,91 @@ class SceneRectTest(unittest.TestCase):
         window, _ = self.make()
         kinds = {type(item).__name__ for item in window.scene.items()}
         self.assertNotIn("QGraphicsLineItem", kinds)
+
+
+@unittest.skipIf(QtWidgets is None, "PySide6 が無い")
+class PrintFontTest(unittest.TestCase):
+    """フォントをポイントで指定すると、出力先の DPI 比のぶん文字だけが
+
+    大きくなる。図形はシーン座標のままワールド変換だけで拡大されるため、
+    印刷 (1200dpi) では画面 (96dpi) の 12.5 倍の文字になっていた。
+    """
+
+    def make(self):
+        window = make_window([blk()])
+        window.module_name_item.setPlainText("counter")
+        add_block(window, netlist.Instance("blk", "u_blk",
+                                           connections={"a": "net", "y": "out"}),
+                  x=100, y=100)
+        window.refreshBlocks()
+        return window
+
+    def render_at(self, window, dpi):
+        image = QtGui.QImage(700, 400, QtGui.QImage.Format_ARGB32)
+        dots_per_meter = round(dpi / 0.0254)
+        image.setDotsPerMeterX(dots_per_meter)
+        image.setDotsPerMeterY(dots_per_meter)
+        image.fill(QtCore.Qt.white)
+        painter = QtGui.QPainter(image)
+        window.scene.render(painter)
+        painter.end()
+        return image
+
+    def test_rendering_does_not_depend_on_device_dpi(self):
+        window = self.make()
+        self.assertEqual(self.render_at(window, 96),
+                         self.render_at(window, 600))
+
+    def test_painted_fonts_use_pixel_sizes(self):
+        window = self.make()
+        port = blox2rtl.PortItem(0, 0, "din", 8, is_input=True,
+                                 main_window=window)
+
+        for label, font in (("モジュール名", window.module_name_item.font()),
+                            ("ポート名", port.text_item.font()),
+                            ("ブロック", blox2rtl.sized_font(
+                                QtGui.QFont(), blox2rtl.MODULE_FONT_PX))):
+            self.assertGreater(font.pixelSize(), 0, label)
+            self.assertEqual(font.pointSize(), -1, label)
+
+
+@unittest.skipIf(QtWidgets is None, "PySide6 が無い")
+class ZoomTest(unittest.TestCase):
+    def test_ctrl_wheel_zooms(self):
+        window = make_window([blk()])
+        view = window.view
+        before = view.zoomFactor()
+        view.zoomBy(blox2rtl.ZOOM_STEP)
+        self.assertGreater(view.zoomFactor(), before)
+
+    def test_zoom_is_clamped(self):
+        window = make_window([blk()])
+        view = window.view
+        for _ in range(60):
+            view.zoomBy(blox2rtl.ZOOM_STEP)
+        self.assertLessEqual(view.zoomFactor(), blox2rtl.ZOOM_MAX)
+
+        for _ in range(120):
+            view.zoomBy(1 / blox2rtl.ZOOM_STEP)
+        self.assertGreaterEqual(view.zoomFactor(), blox2rtl.ZOOM_MIN)
+
+    def test_reset_returns_to_one(self):
+        window = make_window([blk()])
+        window.view.zoomBy(blox2rtl.ZOOM_STEP)
+        window.view.resetZoom()
+        self.assertAlmostEqual(window.view.zoomFactor(), 1.0)
+
+    def test_plain_wheel_does_not_zoom(self):
+        window = make_window([blk()])
+        view = window.view
+        before = view.zoomFactor()
+        event = QtGui.QWheelEvent(
+            QtCore.QPointF(10, 10), QtCore.QPointF(10, 10),
+            QtCore.QPoint(0, 0), QtCore.QPoint(0, 120),
+            QtCore.Qt.NoButton, QtCore.Qt.NoModifier,
+            QtCore.Qt.NoScrollPhase, False)
+        view.wheelEvent(event)
+        self.assertEqual(view.zoomFactor(), before)
 
 
 @unittest.skipIf(QtWidgets is None, "PySide6 が無い")

@@ -29,6 +29,26 @@ CANVAS_MARGIN = 40             # 要素の外接矩形にこれだけ余白を�
 NEW_ITEM_STEP = 30             # 新しい要素が重なったときにずらす量
 PORT_COLUMN_GAP = 160          # サブモジュールの左右からポートまでの距離
 
+# フォントはピクセルで指定する。ポイント指定は出力先の DPI で解決されるため、
+# 図形がシーン座標のまま拡大されるのに対し、文字だけが DPI 比のぶん余計に
+# 大きくなる (画面 96dpi で 12px の文字が、1200dpi のプリンタでは 150px)。
+# ピクセル指定ならシーン座標として扱われ、図形と同じ倍率で拡大される。
+MODULE_FONT_PX = 15            # ブロックのモジュール名
+INSTANCE_FONT_PX = 11          # ブロックのインスタンス名
+PORT_FONT_PX = 11              # ポート名・ワイヤー名
+TOP_NAME_FONT_PX = 15          # トップのモジュール名
+
+ZOOM_STEP = 1.15
+ZOOM_MIN = 0.15
+ZOOM_MAX = 8.0
+
+
+def sized_font(base, pixels, bold=False):
+    font = QtGui.QFont(base)
+    font.setPixelSize(pixels)
+    font.setBold(bold)
+    return font
+
 WINDOW_TITLE = "ブロック図作成ツール"
 
 def bitwidth2linewidth(bit_width):
@@ -72,6 +92,7 @@ class ModuleNameItem(QtWidgets.QGraphicsTextItem):
                       QtWidgets.QGraphicsItem.ItemIsFocusable)
         self.setDefaultTextColor(QtGui.QColor(LINE_COLOR))
         self.main_window = main_window
+        self.setFont(sized_font(self.font(), TOP_NAME_FONT_PX, bold=True))
     
     def paint(self, painter, option, widget=None):
         # 四角枠を描画
@@ -82,9 +103,7 @@ class ModuleNameItem(QtWidgets.QGraphicsTextItem):
 
         # テキストを中央揃えで描画
         painter.setPen(QtGui.QPen(QtGui.QColor(TEXT_COLOR)))
-        font = painter.font()
-        font.setBold(True)
-        painter.setFont(font)
+        painter.setFont(sized_font(self.font(), TOP_NAME_FONT_PX, bold=True))
         painter.drawText(rect, QtCore.Qt.AlignCenter, self.toPlainText())
     
     def mouseDoubleClickEvent(self, event):
@@ -132,6 +151,7 @@ class PortItem(QtWidgets.QGraphicsPolygonItem):
         self.main_window = main_window
         self.text_item = QtWidgets.QGraphicsTextItem(self)
         self.text_item.setDefaultTextColor(QtGui.QColor(TEXT_COLOR))
+        self.text_item.setFont(sized_font(self.text_item.font(), PORT_FONT_PX))
         self.update_text()
     
     def update_text(self):
@@ -283,27 +303,20 @@ class BlockItem(QtWidgets.QGraphicsRectItem):
         # モジュール名とインスタンス名の描画
         painter.setPen(QtGui.QPen(QtGui.QColor(TEXT_COLOR)))
 
-        fontsize = painter.font().pointSize()
+        base = painter.font()
 
-        # モジュール名のフォント設定
-        module_font = painter.font()
-        module_font.setBold(True)  # 太字に設定
-        module_font.setPointSize(fontsize + 4)  # フォントサイズを大きく設定（例: +4ポイント）
-        painter.setFont(module_font)
+        # モジュール名
+        painter.setFont(sized_font(base, MODULE_FONT_PX, bold=True))
         painter.drawText(self.rect().x() + 5, self.rect().y() + 20,
                          self.instance.module_name)
 
-        # インスタンス名のフォント設定
-        instance_font = painter.font()
-        instance_font.setBold(True)  # 太字に設定
-        instance_font.setPointSize(fontsize)  # フォントサイズを大きく設定（例: +4ポイント）
-        painter.setFont(instance_font)
+        # インスタンス名
+        painter.setFont(sized_font(base, INSTANCE_FONT_PX, bold=True))
         painter.drawText(self.rect().x() + 5, self.rect().y() - 5,
                          self.instance.name)
 
         painter.setPen(QtGui.QPen(QtGui.QColor(TEXT_COLOR)))
-        font = painter.font()
-        font.setBold(False)  # 通常のフォントに戻す
+        font = sized_font(base, PORT_FONT_PX)
 
         # 入力ポート名とワイヤーの描画
 
@@ -550,6 +563,39 @@ class CustomGraphicsView(QtWidgets.QGraphicsView):
         # 左ドラッグを矩形選択に取られるので、中ボタンで画面を掴んで動かす
         self._pan_origin = None
 
+    def zoomFactor(self):
+        return self.transform().m11()
+
+    def zoomBy(self, factor, under_mouse=True):
+        target = self.zoomFactor() * factor
+        if not ZOOM_MIN <= target <= ZOOM_MAX:
+            return
+
+        previous = self.transformationAnchor()
+        self.setTransformationAnchor(
+            QtWidgets.QGraphicsView.AnchorUnderMouse if under_mouse
+            else QtWidgets.QGraphicsView.AnchorViewCenter)
+        self.scale(factor, factor)
+        self.setTransformationAnchor(previous)
+
+        self.viewport().update()
+        if self.main_window:
+            self.main_window.showCanvasSize()
+
+    def resetZoom(self):
+        self.setTransform(QtGui.QTransform())
+        self.viewport().update()
+        if self.main_window:
+            self.main_window.showCanvasSize()
+
+    def wheelEvent(self, event):
+        if event.modifiers() & QtCore.Qt.ControlModifier:
+            up = event.angleDelta().y() > 0
+            self.zoomBy(ZOOM_STEP if up else 1 / ZOOM_STEP)
+            event.accept()
+            return
+        super().wheelEvent(event)
+
     def mousePressEvent(self, event):
         if event.button() == QtCore.Qt.MiddleButton:
             self._pan_origin = event.position().toPoint()
@@ -759,6 +805,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self.showBorderAction.toggled.connect(self.view.setShowCanvasBorder)
         viewMenu.addAction(self.showBorderAction)
 
+        viewMenu.addSeparator()
+
+        zoomInAction = QtGui.QAction("拡大", self)
+        zoomInAction.setShortcut(QtGui.QKeySequence.ZoomIn)
+        zoomInAction.triggered.connect(
+            lambda: self.view.zoomBy(ZOOM_STEP, under_mouse=False))
+        viewMenu.addAction(zoomInAction)
+
+        zoomOutAction = QtGui.QAction("縮小", self)
+        zoomOutAction.setShortcut(QtGui.QKeySequence.ZoomOut)
+        zoomOutAction.triggered.connect(
+            lambda: self.view.zoomBy(1 / ZOOM_STEP, under_mouse=False))
+        viewMenu.addAction(zoomOutAction)
+
+        resetZoomAction = QtGui.QAction("等倍に戻す", self)
+        resetZoomAction.setShortcut(QtGui.QKeySequence("Ctrl+0"))
+        resetZoomAction.triggered.connect(self.view.resetZoom)
+        viewMenu.addAction(resetZoomAction)
+
         fitAction = QtGui.QAction("キャンバス全体を表示", self)
         fitAction.triggered.connect(self.fitCanvas)
         viewMenu.addAction(fitAction)
@@ -829,11 +894,13 @@ class MainWindow(QtWidgets.QMainWindow):
         rect = self.scene.sceneRect()
         self.statusBar().showMessage(
             f"キャンバス {int(rect.width())} × {int(rect.height())}"
-            f"    グリッド {GRID_SIZE}")
+            f"    グリッド {GRID_SIZE}"
+            f"    表示 {self.view.zoomFactor() * 100:.0f}%")
 
     def fitCanvas(self):
         self.view.fitInView(self.scene.sceneRect(), QtCore.Qt.KeepAspectRatio)
         self.view.viewport().update()
+        self.showCanvasSize()
 
     # -- ファイル -----------------------------------------------------------
 
