@@ -11,6 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import netlist  # noqa: E402
 import verilog  # noqa: E402
 
 
@@ -103,7 +104,7 @@ class GenerateTest(unittest.TestCase):
             port("a", 1, is_input=True, y=0),
             port("b", 1, is_input=True, y=100),
         ]
-        design = verilog.parse_diagram(diagram)
+        design, _ = netlist.load(diagram)
         self.assertEqual([p.name for p in design.inputs], ["a", "b", "c"])
 
     def test_instances_follow_signal_flow(self):
@@ -114,9 +115,9 @@ class GenerateTest(unittest.TestCase):
             submodule("a", "u_a", x=0),
             submodule("b", "u_b", x=150),
         ]
-        design = verilog.parse_diagram(diagram)
+        design, _ = netlist.load(diagram)
         self.assertEqual(
-            [i.instance_name for i in design.instances], ["u_a", "u_b", "u_c"]
+            [i.name for i in design.instances], ["u_a", "u_b", "u_c"]
         )
 
     def test_port_entry_without_wire_name(self):
