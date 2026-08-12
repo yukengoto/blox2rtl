@@ -26,6 +26,8 @@ GRID_MAJOR_EVERY = 10          # 10 マスごとに濃い線
 GRID_MIN_PIXELS = 4            # 画面上でこれより細かくなったら細線は描かない
 CANVAS_BORDER_COLOR = "#909090"
 CANVAS_MARGIN = 40             # 要素の外接矩形にこれだけ余白を足す
+NEW_ITEM_STEP = 30             # 新しい要素が重なったときにずらす量
+PORT_COLUMN_GAP = 160          # サブモジュールの左右からポートまでの距離
 
 WINDOW_TITLE = "ブロック図作成ツール"
 
@@ -63,12 +65,13 @@ def snap_selection(moved_item):
 # モジュール情報入力ダイアログ
 # モジュール名を描画するクラス
 class ModuleNameItem(QtWidgets.QGraphicsTextItem):
-    def __init__(self, text):
+    def __init__(self, text, main_window=None):
         super().__init__(text)
         self.setFlags(QtWidgets.QGraphicsItem.ItemIsMovable |
                       QtWidgets.QGraphicsItem.ItemIsSelectable |
                       QtWidgets.QGraphicsItem.ItemIsFocusable)
         self.setDefaultTextColor(QtGui.QColor(LINE_COLOR))
+        self.main_window = main_window
     
     def paint(self, painter, option, widget=None):
         # 四角枠を描画
@@ -85,7 +88,12 @@ class ModuleNameItem(QtWidgets.QGraphicsTextItem):
         painter.drawText(rect, QtCore.Qt.AlignCenter, self.toPlainText())
     
     def mouseDoubleClickEvent(self, event):
-        new_name, ok = QtWidgets.QInputDialog.getText(None, "モジュール名の変更", "新しいモジュール名:", text=self.toPlainText())
+        # 名前だけでなくポートも直せるように、モジュール情報の編集を開く
+        if self.main_window is not None:
+            self.main_window.editModule()
+            return
+        new_name, ok = QtWidgets.QInputDialog.getText(
+            None, "モジュール名の変更", "新しいモジュール名:", text=self.toPlainText())
         if ok and new_name:
             self.setPlainText(new_name)
 
@@ -788,7 +796,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.design = netlist.Design()
 
         # モジュール名をシーンに追加
-        self.module_name_item = ModuleNameItem("ModuleName")
+        self.module_name_item = ModuleNameItem("ModuleName", main_window=self)
         self.scene.addItem(self.module_name_item)
         self.wires_to_hide = [] # add names of wires to hide
 
@@ -834,42 +842,113 @@ class MainWindow(QtWidgets.QMainWindow):
         name = Path(file_path).name if file_path else "(未保存)"
         self.setWindowTitle(f"{name} - {WINDOW_TITLE}")
     
+    def ports(self, is_input=None):
+        """トップのポートを、図の上から下の順で返す。
+
+        scene.items() は z 順 (ほぼ挿入の逆) で返すので、そのまま使うと
+        並びが逆さまになる。位置で並べ直す。
+        """
+        items = [item for item in self.scene.items() if isinstance(item, PortItem)]
+        if is_input is not None:
+            items = [item for item in items if item.is_input == is_input]
+        items.sort(key=lambda item: (item.pos().y(), item.pos().x()))
+        return items
+
     def editModule(self):
         module_data = {
             "module_name": self.module_name_item.toPlainText(),
-            "inputs": [(item.name, item.width, item.name in self.wires_to_hide) for item in self.scene.items() if isinstance(item, PortItem) and item.is_input],
-            "outputs": [(item.name, item.width) for item in self.scene.items() if isinstance(item, PortItem) and not item.is_input]
+            "inputs": [(item.name, item.width, item.name in self.wires_to_hide)
+                       for item in self.ports(is_input=True)],
+            "outputs": [(item.name, item.width)
+                        for item in self.ports(is_input=False)],
         }
         dialog = ModuleDialog(module_data=module_data)
-        if dialog.exec() == QtWidgets.QDialog.Accepted:
-            data = dialog.get_data()
-            self.module_name_item.setPlainText(data["module_name"])
-            positions = {} # remember positions before update
-            for item in self.scene.items():
-                if isinstance(item, PortItem):
-                    positions[item.name] = item.pos()
-                    self.scene.removeItem(item)
-            posy = 0
-            for name, width, hide_wire in data["inputs"]:
-                port = PortItem(0, posy, name, width, is_input=True, main_window=self)
-                if positions.get(name): 
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return
+
+        data = dialog.get_data()
+        self.module_name_item.setPlainText(data["module_name"])
+
+        positions = {}  # 既にあるポートは置き場所を変えない
+        for item in self.ports():
+            positions[item.name] = item.pos()
+            self.scene.removeItem(item)
+
+        left, right = self.portColumns()
+        top = self.contentRect().top()
+
+        for column, entries, is_input in ((left, data["inputs"], True),
+                                          (right, data["outputs"], False)):
+            posy = top
+            for entry in entries:
+                name, width = entry[0], entry[1]
+                port = PortItem(0, 0, name, width, is_input=is_input,
+                                main_window=self)
+                if name in positions:
                     port.setPos(positions[name])
+                else:
+                    port.setPos(column, posy)
+                    snap_to_grid(port)
                 self.scene.addItem(port)
                 posy += 50
-            posy = 0
-            for output_data in data["outputs"]:
-                name = output_data[0]
-                width = output_data[1]
-                hide_wire = output_data[2] if len(output_data) > 2 else False
-                #
-                port = PortItem(1000, posy, name, width, is_input=False, main_window=self)
-                if positions.get(name): 
-                    port.setPos(positions[name])
-                self.scene.addItem(port)
-                posy += 50
-            self.wires_to_hide = dialog.get_hidden_portwires()
-            self.updateWires()
-    
+
+        self.wires_to_hide = dialog.get_hidden_portwires()
+        self.updateWires()
+
+    # -- 新しい要素の置き場所 -----------------------------------------------
+
+    def contentRect(self):
+        """今ある要素 (ブロックとポート) が占める範囲。
+
+        itemsBoundingRect() はワイヤー用の余白まで含むので、本体だけを見る。
+        """
+        rects = [block.mapRectToScene(block.rect()) for block in self.blocks()]
+        rects += [port.mapRectToScene(QtCore.QRectF(0, 0, 40, 10))
+                  for port in self.ports()]
+        if not rects:
+            return QtCore.QRectF(0, 0, 400, 200)
+
+        rect = rects[0]
+        for other in rects[1:]:
+            rect = rect.united(other)
+        return rect
+
+    def portColumns(self):
+        """入力ポートと出力ポートを置く x 座標。
+
+        サブモジュールのかたまりの左右に付ける。固定値だと、図が小さいときに
+        本体からうんと離れた場所に置かれてしまう。
+        """
+        rects = [block.mapRectToScene(block.rect()) for block in self.blocks()]
+        if rects:
+            left = min(rect.left() for rect in rects)
+            right = max(rect.right() for rect in rects)
+        else:
+            content = self.contentRect()
+            left, right = content.left(), content.right()
+        return left - PORT_COLUMN_GAP, right + PORT_COLUMN_GAP
+
+    def freePosition(self, width, height):
+        """他の要素と重ならない置き場所を、今ある要素のそばで探す。"""
+        content = self.contentRect()
+        x, y = content.left() + NEW_ITEM_STEP, content.top() + NEW_ITEM_STEP
+
+        for _ in range(200):
+            area = QtCore.QRectF(x, y, width, height)
+            taken = [item for item in self.scene.items(area, QtCore.Qt.IntersectsItemShape)
+                     if isinstance(item, (BlockItem, PortItem))]
+            if not taken:
+                break
+            x += NEW_ITEM_STEP
+            y += NEW_ITEM_STEP
+            if x > content.right():
+                x = content.left() + NEW_ITEM_STEP
+                y += NEW_ITEM_STEP
+
+        return (round(x / GRID_SIZE) * GRID_SIZE,
+                round(y / GRID_SIZE) * GRID_SIZE)
+
+
     # -- インスタンスとモジュール定義 ---------------------------------------
 
     def blocks(self):
@@ -891,8 +970,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         data = dialog.get_data()
-        x = 50 + (self.scene.itemsBoundingRect().width() % 400)
-        y = 50 + (self.scene.itemsBoundingRect().height() % 300)
+        x, y = self.freePosition(150, 100)
         instance = netlist.Instance(data["module_name"], data["instance_name"],
                                     x, y, data["connections"])
         block = BlockItem(0, 0, 150, 50, instance=instance, main_window=self)
@@ -1135,7 +1213,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.design = design
         self.wires_to_hide = list(design.wires_to_hide)
 
-        self.module_name_item = ModuleNameItem(design.name)
+        self.module_name_item = ModuleNameItem(design.name, main_window=self)
         self.module_name_item.setPos(*design.name_pos)
         self.scene.addItem(self.module_name_item)
 

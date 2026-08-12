@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
-    from PySide6 import QtWidgets
+    from PySide6 import QtCore, QtWidgets
     import blox2rtl
     import netlist
 except ImportError:  # PySide6 が無い環境
@@ -117,6 +117,88 @@ class UpdateWiresTest(unittest.TestCase):
         wires = self.wires(window)
         self.assertEqual(len(wires), 1)
         self.assertEqual(wires[0].name, "net")
+
+
+@unittest.skipIf(QtWidgets is None, "PySide6 が無い")
+class PortOrderTest(unittest.TestCase):
+    """scene.items() は z 順で返すので、そのまま使うと並びが逆さまになる。"""
+
+    def make(self):
+        window = blox2rtl.MainWindow()
+        for i, name in enumerate(["clk", "rst", "din", "en"]):
+            port = blox2rtl.PortItem(0, 0, name, 1, is_input=True,
+                                     main_window=window)
+            port.setPos(0, i * 50)
+            window.scene.addItem(port)
+        return window
+
+    def test_scene_order_is_not_the_visual_order(self):
+        window = self.make()
+        raw = [item.name for item in window.scene.items()
+               if isinstance(item, blox2rtl.PortItem)]
+        self.assertNotEqual(raw, ["clk", "rst", "din", "en"])
+
+    def test_ports_are_returned_top_to_bottom(self):
+        window = self.make()
+        self.assertEqual([item.name for item in window.ports(is_input=True)],
+                         ["clk", "rst", "din", "en"])
+
+    def test_order_survives_a_round_trip(self):
+        window = self.make()
+        design = window.buildDesign()
+        self.assertEqual([p.name for p in design.inputs],
+                         ["clk", "rst", "din", "en"])
+
+        reopened = blox2rtl.MainWindow()
+        reopened.loadDesign(netlist.load(netlist.dump(design))[0])
+        self.assertEqual([item.name for item in reopened.ports(is_input=True)],
+                         ["clk", "rst", "din", "en"])
+
+
+@unittest.skipIf(QtWidgets is None, "PySide6 が無い")
+class PlacementTest(unittest.TestCase):
+    def test_new_block_lands_near_the_existing_ones(self):
+        window = make_window([blk()])
+        add_block(window, netlist.Instance("blk", "u0"), x=200, y=200)
+        window.updateWires()
+
+        content = window.contentRect()
+        x, y = window.freePosition(150, 100)
+
+        self.assertGreaterEqual(x, content.left() - blox2rtl.NEW_ITEM_STEP)
+        self.assertLessEqual(x, content.right() + 150)
+        self.assertGreaterEqual(y, content.top() - blox2rtl.NEW_ITEM_STEP)
+
+    def test_new_block_does_not_land_on_an_existing_one(self):
+        window = make_window([blk()])
+        add_block(window, netlist.Instance("blk", "u0"), x=0, y=0)
+        window.updateWires()
+
+        x, y = window.freePosition(150, 100)
+        area = QtCore.QRectF(x, y, 150, 100)
+        overlapping = [item for item in window.scene.items(
+            area, QtCore.Qt.IntersectsItemShape)
+            if isinstance(item, blox2rtl.BlockItem)]
+        self.assertEqual(overlapping, [])
+
+    def test_free_position_is_on_the_grid(self):
+        window = make_window([blk()])
+        add_block(window, netlist.Instance("blk", "u0"), x=37, y=63)
+        x, y = window.freePosition(150, 100)
+        self.assertEqual(x % blox2rtl.GRID_SIZE, 0)
+        self.assertEqual(y % blox2rtl.GRID_SIZE, 0)
+
+    def test_port_columns_follow_the_blocks(self):
+        """固定値だと、図が小さいときに本体から遠く離れた場所に置かれる。"""
+        window = make_window([blk()])
+        add_block(window, netlist.Instance("blk", "u0"), x=300, y=100)
+
+        left, right = window.portColumns()
+        body = window.blocks()[0].mapRectToScene(window.blocks()[0].rect())
+        self.assertLess(left, body.left())
+        self.assertGreater(right, body.right())
+        self.assertLess(body.left() - left, 400)
+        self.assertLess(right - body.right(), 400)
 
 
 @unittest.skipIf(QtWidgets is None, "PySide6 が無い")
